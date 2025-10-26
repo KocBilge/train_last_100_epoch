@@ -1,0 +1,632 @@
+%%writefile /content/train_unified_neutro.py
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# Tek script: DETR + RetinaNet + NEUTRO (Boosted thresholds/NMS/TTA)
+
+import argparse, json, os, random, tempfile, math, copy
+from pathlib import Path
+from dataclasses import dataclass, asdict
+from typing import Dict, List, Tuple, Any, Optional
+import numpy as np
+from PIL import Image
+from tqdm import tqdm
+
+import torch
+import torch.nn.utils as nn_utils
+from torch.utils.data import Dataset, DataLoader
+from torch.amp import autocast, GradScaler
+from torch.optim.lr_scheduler import LambdaLR
+
+import torchvision
+import torchvision.transforms.functional as TF
+from torchvision.transforms import ColorJitter
+from torchvision.models.detection import retinanet_resnet50_fpn_v2
+from torchvision.ops import box_convert
+from torchvision.models import ResNet50_Weights
+
+from transformers import DetrForObjectDetection, DetrImageProcessor
+from pycocotools.coco import COCO
+from pycocotools.cocoeval import COCOeval
+
+def set_seed(seed=42):
+    random.seed(seed); np.random.seed(seed)
+    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True
+
+def ensure_paths(root: Path) -> Dict[str, Path]:
+    train_im = root / "train"; val_im = root / "valid"
+    train_js = root / "coco_ann" / "instances_train.json"
+    val_js   = root / "coco_ann" / "instances_val.json"
+    for p in [train_im, val_im, train_js, val_js]:
+        if not p.exists():
+            raise FileNotFoundError(f"Missing path: {p}")
+    return {"train_im": train_im, "val_im": val_im, "train_js": train_js, "val_js": val_js}
+
+def iou_xyxy(a: np.ndarray, b: np.ndarray) -> float:
+    xa1,ya1,xa2,ya2 = a; xb1,yb1,xb2,yb2 = b
+    inter_w = max(0.0, min(xa2, xb2) - max(xa1, xb1))
+    inter_h = max(0.0, min(ya2, yb2) - max(ya1, yb1))
+    inter = inter_w * inter_h
+    area_a = max(0.0, (xa2-xa1)) * max(0.0, (ya2-ya1))
+    area_b = max(0.0, (xb2-xb1)) * max(0.0, (yb2-yb1))
+    union = area_a + area_b - inter + 1e-9
+    return float(inter/union)
+
+def wbf_fuse(boxes_scores_labels: List[np.ndarray], iou_thr: float = 0.55) -> np.ndarray:
+    if not boxes_scores_labels:
+        return np.zeros((0,6), dtype=float)
+    arrs = [x for x in boxes_scores_labels if x is not None and x.size>0]
+    if not arrs:
+        return np.zeros((0,6), dtype=float)
+    all_boxes = np.concatenate(arrs, axis=0)
+    out = []
+    used = np.zeros(len(all_boxes), dtype=bool)
+    for i in range(len(all_boxes)):
+        if used[i]: continue
+        bi = all_boxes[i]; grp=[i]
+        for j in range(i+1, len(all_boxes)):
+            if used[j]: continue
+            bj = all_boxes[j]
+            if int(bi[5]) != int(bj[5]): continue
+            if iou_xyxy(bi[:4], bj[:4]) >= iou_thr:
+                grp.append(j)
+        used[grp]=True
+        g = all_boxes[grp]
+        w = g[:,4:5]
+        b = (g[:,:4]*w).sum(0)/max(1e-9,w.sum())
+        s = float(g[:,4].max())
+        l = int(g[:,5][0])
+        out.append([*b, s, l])
+    return np.array(out, dtype=float)
+
+def neutro_from_scores(scores: List[float]) -> Dict[str, float]:
+    if not scores:
+        return {"T_mean": 0.0, "I_mean": 0.0, "F_mean": 0.0, "count": 0}
+    p = np.asarray(scores, dtype=np.float32)
+    T = p; F = 1.0 - p; I = 1.0 - np.abs(2.0 * p - 1.0)
+    return {"T_mean": float(T.mean()), "I_mean": float(I.mean()), "F_mean": float(F.mean()), "count": int(p.size)}
+
+def hflip_boxes_xywh(boxes_xywh: np.ndarray, width: int) -> np.ndarray:
+    out = boxes_xywh.copy()
+    out[:, 0] = width - out[:, 0] - out[:, 2]
+    return out
+
+def hflip_boxes_xyxy(boxes_xyxy: np.ndarray, width: int) -> np.ndarray:
+    out = boxes_xyxy.copy()
+    x1 = boxes_xyxy[:,0].copy(); x2 = boxes_xyxy[:,2].copy()
+    out[:,0] = width - x2; out[:,2] = width - x1
+    return out
+
+def maybe_hflip_pil_and_anns(img: Image.Image, anns: List[Dict[str, Any]], p: float):
+    if random.random() >= p or len(anns) == 0:
+        return img, anns
+    w, h = img.size
+    img2 = TF.hflip(img)
+    boxes = np.array([a["bbox"] for a in anns], dtype=np.float32)
+    boxes2 = hflip_boxes_xywh(boxes, w)
+    anns2 = []
+    for a, bb in zip(anns, boxes2):
+        a2 = dict(a); a2["bbox"] = [float(bb[0]), float(bb[1]), float(bb[2]), float(bb[3])]
+        anns2.append(a2)
+    return img2, anns2
+
+class ModelEMA:
+    def __init__(self, model: torch.nn.Module, decay: float = 0.999):
+        self.decay = decay
+        self.shadow = {k: v.detach().clone() for k, v in model.state_dict().items() if v.dtype.is_floating_point}
+        self.backup = None
+    @torch.no_grad()
+    def update(self, model: torch.nn.Module):
+        for k, v in model.state_dict().items():
+            if k in self.shadow and v.dtype.is_floating_point:
+                self.shadow[k].mul_(self.decay).add_(v.detach(), alpha=1.0 - self.decay)
+    def apply(self, model: torch.nn.Module):
+        self.backup = {k: v.detach().clone() for k, v in model.state_dict().items()}
+        merged = dict(self.backup); merged.update(self.shadow)
+        model.load_state_dict(merged, strict=False)
+    def restore(self, model: torch.nn.Module):
+        if self.backup is not None:
+            model.load_state_dict(self.backup, strict=False); self.backup = None
+    def apply_and_restore(self, model: torch.nn.Module):
+        class _Ctx:
+            def __init__(self, ema, m): self.ema, self.m = ema, m
+            def __enter__(self): self.ema.apply(self.m)
+            def __exit__(self, *exc): self.ema.restore(self.m)
+        return _Ctx(self, model)
+
+class CocoBase(Dataset):
+    def __init__(self, img_dir, ann_json, aug_hflip=0.0, color_jitter: Optional[ColorJitter] = None, for_detr=False):
+        self.img_dir = Path(img_dir)
+        self.coco = COCO(str(ann_json))
+        self.ids = list(sorted(self.coco.imgs.keys()))
+        self.cat_ids = sorted(self.coco.getCatIds())
+        self.catid_to_idx = {cid: i for i, cid in enumerate(self.cat_ids)}
+        self.idx_to_catid = {i: cid for i, cid in enumerate(self.cat_ids)}
+        self.aug_hflip = float(aug_hflip)
+        self.color_jitter = color_jitter
+        self.for_detr = for_detr
+    def __len__(self): return len(self.ids)
+    @property
+    def num_classes(self): return len(self.cat_ids)
+    def _read(self, idx):
+        img_id = self.ids[idx]
+        info = self.coco.loadImgs([img_id])[0]
+        image = Image.open(self.img_dir / info["file_name"]).convert("RGB")
+        W, H = image.size
+        anns = [a for a in self.coco.loadAnns(self.coco.getAnnIds(imgIds=[img_id]))
+                if a.get("bbox") and a["bbox"][2] > 0 and a["bbox"][3] > 0 and not a.get("iscrowd", 0)]
+        return img_id, image, (H, W), anns
+
+class CocoForDetr(CocoBase):
+    def __getitem__(self, idx):
+        img_id, img, orig_size, anns = self._read(idx)
+        img, anns = maybe_hflip_pil_and_anns(img, anns, self.aug_hflip)
+        if self.color_jitter is not None:
+            img = self.color_jitter(img)
+        anns2 = [{"category_id": int(self.catid_to_idx[a["category_id"]]),
+                  "bbox": a["bbox"],
+                  **{k: v for k, v in a.items() if k not in ("category_id","bbox")}} for a in anns]
+        return img, {"image_id": int(img_id), "annotations": anns2, "orig_size": orig_size}
+
+class CocoForRetina(CocoBase):
+    def __getitem__(self, idx):
+        img_id, img, orig_size, anns = self._read(idx)
+        img, anns = maybe_hflip_pil_and_anns(img, anns, self.aug_hflip)
+        if self.color_jitter is not None:
+            img = self.color_jitter(img)
+        img_t = TF.to_tensor(img)
+        if len(anns) > 0:
+            b = torch.tensor([a["bbox"] for a in anns], dtype=torch.float32)
+            boxes = box_convert(b, in_fmt="xywh", out_fmt="xyxy")
+            labels = torch.tensor([self.catid_to_idx[a["category_id"]] + 1 for a in anns], dtype=torch.int64)
+        else:
+            boxes = torch.zeros((0,4), dtype=torch.float32)
+            labels = torch.zeros((0,), dtype=torch.int64)
+        return img_t, {"image_id": torch.tensor([int(img_id)]), "boxes": boxes, "labels": labels}, orig_size
+
+def collate_detr(processor):
+    def _f(batch):
+        imgs, targs = list(zip(*batch))
+        enc = processor(images=list(imgs), annotations=list(targs), return_tensors="pt")
+        return {"pixel_values": enc["pixel_values"],
+                "labels": enc["labels"],
+                "image_ids": [t["image_id"] for t in targs],
+                "orig_sizes": torch.tensor([t["orig_size"] for t in targs], dtype=torch.long)}
+    return _f
+
+def collate_retina():
+    def _f(batch):
+        imgs, targs, sizes = list(zip(*batch))
+        return {"images": list(imgs), "targets": list(targs),
+                "image_ids": [int(t["image_id"].item()) for t in targs],
+                "orig_sizes": torch.tensor(list(sizes), dtype=torch.long)}
+    return _f
+
+@dataclass
+class EvalSummary:
+    AP: float; AP50: float; AP75: float; APS: float; APM: float; APL: float
+    AR1: float; AR10: float; AR100: float; P50: float; R50: float; F1_50: float
+    def to_dict(self): return asdict(self)
+
+def summarize_coco(coco_eval, iou_thr=0.5) -> EvalSummary:
+    coco_eval.summarize()
+    s = coco_eval.stats
+    AP, AP50, AP75, APS, APM, APL, AR1, AR10, AR100 = [float(x) for x in s[:9]]
+    prec, rec = coco_eval.eval["precision"], coco_eval.eval["recall"]
+    t_idx = np.where(np.isclose(coco_eval.params.iouThrs, iou_thr))[0]
+    if len(t_idx)==0: P50=R50=F1=0.0
+    else:
+        t=t_idx[0]; P=prec[t]; P=P[P>-1]; R=rec[t]; R=R[R>-1]
+        P50=float(P.mean()) if P.size else 0.0
+        R50=float(R.mean()) if R.size else 0.0
+        F1=(2*P50*R50/(P50+R50)) if (P50+R50)>0 else 0.0
+    return EvalSummary(AP,AP50,AP75,APS,APM,APL,AR1,AR10,AR100,P50,R50,F1)
+
+class Evaluator:
+    def __init__(self, ds_val, device): self.ds_val, self.device = ds_val, device
+    def _best_thresholds_by_class(self, base_results: List[Dict[str,Any]], img_ids: List[int], iou_thr=0.5) -> Dict[int,float]:
+        grid = np.linspace(0.05, 0.95, num=19).tolist()
+        out_thr = {}
+        for cid in self.ds_val.cat_ids:
+            best_f1, best_t = -1.0, 0.5
+            for thr in grid:
+                filt = [r for r in base_results if (r["category_id"]==cid and r["score"]>=thr)]
+                if not filt: continue
+                with tempfile.NamedTemporaryFile(mode="w",suffix=".json",delete=False) as f:
+                    json.dump(filt,f); tmp=f.name
+                coco_dt=self.ds_val.coco.loadRes(tmp)
+                cocoEval=COCOeval(self.ds_val.coco,coco_dt,"bbox")
+                cocoEval.params.imgIds=list(set(img_ids)); cocoEval.params.catIds=[int(cid)]
+                cocoEval.evaluate(); cocoEval.accumulate()
+                prec, rec = cocoEval.eval["precision"], cocoEval.eval["recall"]
+                t_idx = np.where(np.isclose(cocoEval.params.iouThrs, iou_thr))[0]
+                if len(t_idx):
+                    t=t_idx[0]; P=prec[t]; P=P[P>-1]; R=rec[t]; R=R[R>-1]
+                    Pm=float(P.mean()) if P.size else 0.0
+                    Rm=float(R.mean()) if R.size else 0.0
+                    f1=(2*Pm*Rm/(Pm+Rm)) if (Pm+Rm)>0 else 0.0
+                    if f1>best_f1: best_f1, best_t = f1, thr
+                os.remove(tmp)
+            out_thr[int(cid)] = float(best_t)
+        return out_thr
+    @torch.no_grad()
+    def evaluate_from_predictions(self, results, ids, extra_metrics: Dict[str, Any] | None = None):
+        if results is None:
+            em = extra_metrics or {}
+            return EvalSummary(*([0]*12)), em
+        with tempfile.NamedTemporaryFile(mode="w",suffix=".json",delete=False) as f:
+            json.dump(results,f); tmp=f.name
+        coco_dt=self.ds_val.coco.loadRes(tmp)
+        cocoEval=COCOeval(self.ds_val.coco,coco_dt,"bbox")
+        cocoEval.params.imgIds=list(set(ids))
+        cocoEval.evaluate(); cocoEval.accumulate()
+        out=summarize_coco(cocoEval,0.5)
+        os.remove(tmp)
+        em = extra_metrics or {}
+        if em.get("learn_class_thr", False):
+            try:
+                thr = self._best_thresholds_by_class(results, ids, iou_thr=0.5)
+                em["class_thresholds"] = thr
+            except Exception as e:
+                em["class_thresholds_error"] = str(e)
+        return out, em
+
+def make_warmup_cosine(total_steps: int, warmup_steps: int, min_scale: float = 0.1):
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return step / max(1, warmup_steps)
+        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        progress = min(1.0, max(0.0, progress))
+        return min_scale + (1.0 - min_scale) * 0.5 * (1.0 + math.cos(math.pi * progress))
+    return lr_lambda
+
+def dynamic_threshold(base_thr: float, score: float, alpha_unc: float) -> float:
+    T = float(score); I = 1.0 - abs(2.0*T - 1.0)
+    return max(base_thr, min(0.99, base_thr + alpha_unc*I))
+
+def to_dt_rows_xyxy(boxes, scores, labels, idx_to_catid, img_id):
+    res=[]; score_list=[]; arr=[]
+    for (x1,y1,x2,y2),sc,lb in zip(boxes, scores, labels):
+        w = float(x2 - x1); h = float(y2 - y1)
+        cat = int(idx_to_catid[int(lb)])
+        res.append({"image_id": int(img_id), "category_id": cat,
+                    "bbox":[float(x1),float(y1),float(w),float(h)], "score": float(sc)})
+        score_list.append(float(sc))
+        arr.append([float(x1),float(y1),float(x2),float(y2), float(sc), float(cat)])
+    return res, score_list, np.array(arr, dtype=float) if arr else np.zeros((0,6),dtype=float)
+
+class DetrTrainer:
+    def __init__(self, paths, out_dir, **kw):
+        set_seed(kw.get("seed",42))
+        self.device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print("[DETR] device:", self.device)
+        shortest = kw.get("short_edge", 800); longest  = kw.get("long_edge", 1333)
+        self.processor=DetrImageProcessor.from_pretrained(
+            "facebook/detr-resnet-50",
+            size={"shortest_edge": shortest, "longest_edge": longest}
+        )
+        aug_hflip = kw.get("hflip", 0.5)
+        color_jitter = ColorJitter(0.1, 0.1, 0.1, 0.05) if kw.get("cj", False) else None
+        self.ds_tr=CocoForDetr(paths["train_im"],paths["train_js"],aug_hflip=aug_hflip,color_jitter=color_jitter,for_detr=True)
+        self.ds_va=CocoForDetr(paths["val_im"],paths["val_js"],aug_hflip=0.0,color_jitter=None,for_detr=True)
+        self.dl_tr=DataLoader(self.ds_tr,batch_size=kw.get("batch_size",4),shuffle=True,
+                              num_workers=kw.get("num_workers",2),pin_memory=True,collate_fn=collate_detr(self.processor))
+        self.dl_va=DataLoader(self.ds_va,batch_size=kw.get("batch_size",4),shuffle=False,
+                              num_workers=kw.get("num_workers",2),pin_memory=True,collate_fn=collate_detr(self.processor))
+        self.model=DetrForObjectDetection.from_pretrained(
+            "facebook/detr-resnet-50",
+            num_labels=self.ds_tr.num_classes,
+            ignore_mismatched_sizes=True
+        ).to(self.device)
+        backbone, others = [], []
+        for n,p in self.model.named_parameters():
+            (backbone if "backbone" in n else others).append(p)
+        base_lr = kw.get("lr",1e-4)
+        self.opt=torch.optim.AdamW(
+            [{"params": backbone, "lr": base_lr*0.1}, {"params": others, "lr": base_lr}],
+            weight_decay=kw.get("weight_decay",1e-4)
+        )
+        self.use_amp = not kw.get("no_amp", False)
+        self.scaler  = GradScaler('cuda', enabled=self.use_amp)
+        self.accum_steps = max(1, int(kw.get("accum", 1)))
+        total_steps = len(self.dl_tr) * kw.get("epochs",100)
+        warmup_steps = int(kw.get("warmup_ratio", 0.05) * total_steps)
+        self.scheduler = LambdaLR(self.opt, make_warmup_cosine(total_steps, warmup_steps, min_scale=kw.get("cos_min",0.1)))
+        self.ema = ModelEMA(self.model, decay=kw.get("ema_decay", 0.999)) if kw.get("ema", True) else None
+        self.score_thresh = float(kw.get("score_thresh", 0.05))
+        self.alpha_unc = float(kw.get("alpha_unc", 0.3))
+        self.use_adaptive_thr = bool(kw.get("use_adaptive_thr", True))
+        self.use_uncertain_thr = bool(kw.get("use_uncertain_thr", True))
+        self.use_tta = bool(kw.get("use_tta", True))
+        self.wbf_iou = float(kw.get("wbf_iou", 0.55))
+        self.evaluator=Evaluator(self.ds_va,self.device)
+        self.out_dir=out_dir; out_dir.mkdir(parents=True,exist_ok=True)
+        self.best=-np.inf; self.no_imp=0
+        self.pat=kw.get("patience",40); self.min_d=kw.get("min_delta",1e-3)
+        self.cls_thr_map = {}
+        thr_file = out_dir/"cls_thresholds.json"
+        if thr_file.exists():
+            try:
+                self.cls_thr_map = {int(k): float(v) for k,v in json.load(open(thr_file)).items()}
+                print(f"[DETR] Loaded class thresholds from {thr_file}")
+            except Exception as e:
+                print("[DETR] threshold load error:", e)
+    def fit(self,epochs):
+        step=0
+        for e in range(1,epochs+1):
+            self.model.train(); total_loss=0.0; n_batches=0
+            self.opt.zero_grad(set_to_none=True)
+            for bi, b in enumerate(tqdm(self.dl_tr,desc=f"[DETR][train {e}]")):
+                pv=b["pixel_values"].to(self.device)
+                labels=[{k:(v.to(self.device) if isinstance(v,torch.Tensor) else v) for k,v in t.items()} for t in b["labels"]]
+                with autocast('cuda',enabled=self.use_amp):
+                    out=self.model(pixel_values=pv,labels=labels); loss=out.loss
+                self.scaler.scale(loss/self.accum_steps).backward()
+                self.scaler.unscale_(self.opt)
+                nn_utils.clip_grad_norm_(self.model.parameters(),0.1)
+                if (bi+1) % self.accum_steps == 0:
+                    self.scaler.step(self.opt); self.scaler.update()
+                    self.opt.zero_grad(set_to_none=True)
+                    self.scheduler.step(); step+=1
+                    if self.ema: self.ema.update(self.model)
+                total_loss += float(loss.detach()); n_batches += 1
+            summ, extra = self._eval(use_ema=True, learn_thr=self.use_adaptive_thr)
+            n = extra.get("neutro", {})
+            print(f"[DETR][epoch {e}] loss={total_loss/max(1,n_batches):.4f} | AP50={summ.AP50:.3f} | F1={summ.F1_50:.3f} "
+                  f"| neutro: T={n.get('T_mean',0):.3f} I={n.get('I_mean',0):.3f} F={n.get('F_mean',0):.3f}")
+            if "class_thresholds" in extra:
+                with open(self.out_dir/"cls_thresholds.json","w") as f:
+                    json.dump(extra["class_thresholds"], f, indent=2)
+                self.cls_thr_map = extra["class_thresholds"]
+            if summ.AP50>self.best+self.min_d:
+                self.best=summ.AP50; self.no_imp=0
+                torch.save(self.model.state_dict(), self.out_dir/'best_detr.pt')
+                if self.ema:
+                    torch.save(self.ema.shadow, self.out_dir/'best_detr_ema.pth')
+            else:
+                self.no_imp+=1
+                if self.no_imp>=self.pat:
+                    print(f"[DETR] Early stop at {e} (best AP50={self.best:.3f})"); break
+    @torch.no_grad()
+    def _eval(self, use_ema: bool = True, learn_thr: bool=False):
+        if self.ema and use_ema:
+            ctx = self.ema.apply_and_restore(self.model)
+        else:
+            class _N:
+                def __enter__(self): pass
+                def __exit__(self, a,b,c): pass
+            ctx = _N()
+        with ctx:
+            self.model.eval(); res=[]; ids=[]; score_list=[]
+            for b in self.dl_va:
+                pv=b["pixel_values"].to(self.device)
+                out=self.model(pixel_values=pv)
+                preds=self.processor.post_process_object_detection(out, target_sizes=b["orig_sizes"].to(self.device), threshold=0.0)
+                # TTA flip
+                pv_f = torch.flip(pv, dims=[-1]) if self.use_tta else None
+                preds_f = None
+                if self.use_tta:
+                    out_f = self.model(pixel_values=pv_f)
+                    preds_f = self.processor.post_process_object_detection(out_f, target_sizes=b["orig_sizes"].to(self.device), threshold=0.0)
+                for i,p in enumerate(preds):
+                    img=int(b["image_ids"][i]); ids.append(img)
+                    arrs=[]
+                    # base
+                    r, s_list, arr = to_dt_rows_xyxy(p["boxes"].cpu().numpy(), p["scores"].cpu().numpy(), p["labels"].cpu().numpy(),
+                                                     self.ds_va.idx_to_catid, img)
+                    arrs.append(arr)
+                    # flip
+                    if self.use_tta and preds_f is not None:
+                        W = int(b["orig_sizes"][i][1].item())
+                        p2 = preds_f[i]
+                        bx2 = hflip_boxes_xyxy(p2["boxes"].cpu().numpy(), W)
+                        r2, s2, arr2 = to_dt_rows_xyxy(bx2, p2["scores"].cpu().numpy(), p2["labels"].cpu().numpy(),
+                                                       self.ds_va.idx_to_catid, img)
+                        arrs.append(arr2); s_list.extend(s2); r.extend(r2)
+                    fused = wbf_fuse(arrs, iou_thr=self.wbf_iou) if self.use_tta else arr
+                    for row in fused.tolist() if fused.size>0 else []:
+                        x1,y1,x2,y2,sc,cat = row; cat=int(cat)
+                        thr = self.score_thresh
+                        if self.cls_thr_map and self.use_adaptive_thr:
+                            thr = max(thr, float(self.cls_thr_map.get(cat, thr)))
+                        if self.use_uncertain_thr:
+                            thr = dynamic_threshold(thr, sc, self.alpha_unc)
+                        if float(sc) < thr: continue
+                        w,h=x2-x1,y2-y1
+                        res.append({"image_id": img, "category_id": cat,
+                                    "bbox":[float(x1),float(y1),float(w),float(h)], "score": float(sc)})
+                        score_list.append(float(sc))
+            neutro = neutro_from_scores(score_list)
+            extra = {"neutro": neutro, "learn_class_thr": bool(learn_thr)}
+            return self.evaluator.evaluate_from_predictions(res,ids, extra)
+
+class RetinaTrainer:
+    def __init__(self, paths, out_dir, **kw):
+        set_seed(kw.get("seed",42))
+        self.device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print("[RETINA] device:", self.device)
+        aug_hflip = kw.get("hflip", 0.5)
+        color_jitter = ColorJitter(0.1, 0.1, 0.1, 0.05) if kw.get("cj", True) else None
+        self.ds_tr=CocoForRetina(paths["train_im"],paths["train_js"],aug_hflip=aug_hflip,color_jitter=color_jitter)
+        self.ds_va=CocoForRetina(paths["val_im"],paths["val_js"],aug_hflip=0.0,color_jitter=None)
+        self.dl_tr=DataLoader(self.ds_tr,batch_size=kw.get("batch_size",4),shuffle=True,
+                              num_workers=kw.get("num_workers",2),pin_memory=True,collate_fn=collate_retina())
+        self.dl_va=DataLoader(self.ds_va,batch_size=kw.get("batch_size",4),shuffle=False,
+                              num_workers=kw.get("num_workers",2),pin_memory=True,collate_fn=collate_retina())
+        nc=self.ds_tr.num_classes+1
+        self.model=retinanet_resnet50_fpn_v2(weights=None, weights_backbone=ResNet50_Weights.IMAGENET1K_V2, num_classes=nc).to(self.device)
+        self.opt=torch.optim.AdamW(self.model.parameters(),lr=kw.get("lr",1e-4),weight_decay=kw.get("weight_decay",1e-4))
+        self.use_amp = not kw.get("no_amp", False)
+        self.scaler  = GradScaler('cuda', enabled=self.use_amp)
+        self.accum_steps = max(1, int(kw.get("accum", 1)))
+        total_steps = len(self.dl_tr) * kw.get("epochs",100)
+        warmup_steps = int(kw.get("warmup_ratio", 0.05) * total_steps)
+        self.scheduler = LambdaLR(self.opt, make_warmup_cosine(total_steps, warmup_steps, min_scale=kw.get("cos_min",0.1)))
+        self.ema = ModelEMA(self.model, decay=kw.get("ema_decay", 0.999)) if kw.get("ema", True) else None
+        self.score_thresh = float(kw.get("score_thresh", 0.05))
+        self.alpha_unc = float(kw.get("alpha_unc", 0.3))
+        self.use_adaptive_thr = bool(kw.get("use_adaptive_thr", True))
+        self.use_uncertain_thr = bool(kw.get("use_uncertain_thr", True))
+        self.use_tta = bool(kw.get("use_tta", True))
+        self.wbf_iou = float(kw.get("wbf_iou", 0.55))
+        self.evaluator=Evaluator(self.ds_va,self.device)
+        self.out_dir=out_dir; out_dir.mkdir(parents=True,exist_ok=True)
+        self.best=-np.inf; self.no_imp=0
+        self.pat=kw.get("patience",40); self.min_d=kw.get("min_delta",1e-3)
+        self.cls_thr_map = {}
+        thr_file = out_dir/"cls_thresholds.json"
+        if thr_file.exists():
+            try:
+                self.cls_thr_map = {int(k): float(v) for k,v in json.load(open(thr_file)).items()}
+                print(f"[RETINA] Loaded class thresholds from {thr_file}")
+            except Exception as e:
+                print("[RETINA] threshold load error:", e)
+    def fit(self,epochs):
+        for e in range(1,epochs+1):
+            self.model.train(); total_loss=0.0;n_batches=0
+            self.opt.zero_grad(set_to_none=True)
+            for bi, b in enumerate(tqdm(self.dl_tr,desc=f"[RETINA][train {e}]")):
+                imgs=[im.to(self.device) for im in b["images"]]
+                tg=[{"boxes":t["boxes"].to(self.device),"labels":t["labels"].to(self.device)} for t in b["targets"]]
+                with autocast('cuda',enabled=self.use_amp):
+                    loss_d=self.model(imgs,tg); loss=sum(v for v in loss_d.values())
+                self.scaler.scale(loss/self.accum_steps).backward()
+                self.scaler.unscale_(self.opt)
+                nn_utils.clip_grad_norm_(self.model.parameters(),0.1)
+                if (bi+1) % self.accum_steps == 0:
+                    self.scaler.step(self.opt); self.scaler.update()
+                    self.opt.zero_grad(set_to_none=True)
+                    self.scheduler.step()
+                    if self.ema: self.ema.update(self.model)
+                total_loss+=float(loss.detach()); n_batches+=1
+            summ, extra = self._eval(use_ema=True, learn_thr=self.use_adaptive_thr)
+            n = extra.get("neutro", {})
+            print(f"[RETINA][epoch {e}] loss={total_loss/max(1,n_batches):.4f} | AP50={summ.AP50:.3f} "
+                  f"| neutro: T={n.get('T_mean',0):.3f} I={n.get('I_mean',0):.3f} F={n.get('F_mean',0):.3f}")
+            if "class_thresholds" in extra:
+                with open(self.out_dir/"cls_thresholds.json","w") as f:
+                    json.dump(extra["class_thresholds"], f, indent=2)
+                self.cls_thr_map = extra["class_thresholds"]
+            if summ.AP50>self.best+self.min_d:
+                self.best=summ.AP50; self.no_imp=0
+                torch.save(self.model.state_dict(), self.out_dir/'best_retina.pt')
+                if self.ema:
+                    torch.save(self.ema.shadow, self.out_dir/'best_retina_ema.pth')
+            else:
+                self.no_imp+=1
+                if self.no_imp>=self.pat:
+                    print(f"[RETINA] Early stop at {e} (best AP50={self.best:.3f})"); break
+    @torch.no_grad()
+    def _eval(self, use_ema: bool = True, learn_thr: bool=False):
+        if self.ema and use_ema:
+            ctx = self.ema.apply_and_restore(self.model)
+        else:
+            class _N:
+                def __enter__(self): pass
+                def __exit__(self, a,b,c): pass
+            ctx = _N()
+        with ctx:
+            self.model.eval(); res=[]; ids=[]; score_list=[]
+            for b in self.dl_va:
+                imgs=[im.to(self.device) for im in b["images"]]
+                outs=self.model(imgs)
+                outs_f=None
+                if self.use_tta:
+                    imgs_f=[torch.flip(im, dims=[2]) for im in imgs]
+                    outs_f=self.model(imgs_f)
+                for i,p in enumerate(outs):
+                    img=b["image_ids"][i]; ids.append(img)
+                    boxes=p["boxes"].detach().cpu().numpy()
+                    scores=p["scores"].detach().cpu().numpy()
+                    labels=p["labels"].detach().cpu().numpy()
+                    arrs=[]
+                    arrs.append(np.array([[*boxes[j], float(scores[j]), float(self.ds_va.idx_to_catid[int(labels[j])-1])]
+                                          for j in range(len(scores)) if int(labels[j])!=0], dtype=float))
+                    if self.use_tta and outs_f is not None:
+                        pf=outs_f[i]
+                        boxes_f=pf["boxes"].detach().cpu().numpy()
+                        W=int(b["orig_sizes"][i][1].item())
+                        boxes_f=hflip_boxes_xyxy(boxes_f, W)
+                        scores_f=pf["scores"].detach().cpu().numpy()
+                        labels_f=pf["labels"].detach().cpu().numpy()
+                        arrs.append(np.array([[*boxes_f[j], float(scores_f[j]), float(self.ds_va.idx_to_catid[int(labels_f[j])-1])]
+                                              for j in range(len(scores_f)) if int(labels_f[j])!=0], dtype=float))
+                    fused = wbf_fuse(arrs, iou_thr=self.wbf_iou) if self.use_tta else arrs[0]
+                    for row in fused.tolist() if fused.size>0 else []:
+                        x1,y1,x2,y2,sc,cat=row; cat=int(cat)
+                        thr=self.score_thresh
+                        if self.cls_thr_map and self.use_adaptive_thr:
+                            thr=max(thr, float(self.cls_thr_map.get(cat, thr)))
+                        if self.use_uncertain_thr:
+                            thr=dynamic_threshold(thr, sc, self.alpha_unc)
+                        if float(sc) < thr: continue
+                        w,h=x2-x1,y2-y1
+                        res.append({"image_id": int(img), "category_id": cat,
+                                    "bbox":[float(x1),float(y1),float(w),float(h)],"score": float(sc)})
+                        score_list.append(float(sc))
+            neutro = neutro_from_scores(score_list)
+            extra = {"neutro": neutro, "learn_class_thr": bool(learn_thr)}
+            return self.evaluator.evaluate_from_predictions(res,ids, extra)
+
+def parse_args():
+    p=argparse.ArgumentParser()
+    p.add_argument("--model",choices=["detr","retina"],required=True)
+    p.add_argument("--data-root",required=True)
+    p.add_argument("--out-dir",default="./out_model")
+    p.add_argument("--epochs",type=int,default=200)
+    p.add_argument("--batch-size",type=int,default=4)
+    p.add_argument("--num-workers",type=int,default=2)
+    p.add_argument("--lr",type=float,default=1e-4)
+    p.add_argument("--weight-decay",type=float,default=1e-4)
+    p.add_argument("--seed",type=int,default=42)
+    p.add_argument("--patience",type=int,default=40)
+    p.add_argument("--min-delta",type=float,default=1e-3)
+    p.add_argument("--no-amp",action="store_true")
+    p.add_argument("--accum",type=int,default=1)
+    p.add_argument("--warmup-ratio",type=float,default=0.05)
+    p.add_argument("--cos-min",type=float,default=0.1)
+    p.add_argument("--use-adaptive-thr",action="store_true", default=True)
+    p.add_argument("--use-uncertain-thr",action="store_true", default=True)
+    p.add_argument("--alpha-unc",type=float,default=0.3)
+    p.add_argument("--use-tta",action="store_true", default=True)
+    p.add_argument("--wbf-iou",type=float,default=0.55)
+    p.add_argument("--hflip",type=float,default=0.5)
+    p.add_argument("--cj",action="store_true")
+    p.add_argument("--score-thresh",type=float,default=0.05)
+    p.add_argument("--short-edge",type=int,default=800)
+    p.add_argument("--long-edge",type=int,default=1333)
+    return p.parse_args()
+
+def make_warmup_cosine(total_steps: int, warmup_steps: int, min_scale: float = 0.1):
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return step / max(1, warmup_steps)
+        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        progress = min(1.0, max(0.0, progress))
+        return min_scale + (1.0 - min_scale) * 0.5 * (1.0 + math.cos(math.pi * progress))
+    return lr_lambda
+
+def main():
+    args=parse_args()
+    set_seed(args.seed)
+    paths=ensure_paths(Path(args.data_root))
+    out_dir=Path(args.out_dir); out_dir.mkdir(parents=True,exist_ok=True)
+    common = {
+        "batch_size": args.batch_size, "num_workers": args.num_workers,
+        "lr": args.lr, "weight_decay": args.weight_decay, "seed": args.seed,
+        "epochs": args.epochs, "patience": args.patience, "min_delta": args.min_delta,
+        "no_amp": args.no_amp, "accum": args.accum, "warmup_ratio": args.warmup_ratio, "cos_min": args.cos_min,
+        "ema": True, "ema_decay": 0.999, "hflip": args.hflip, "cj": args.cj,
+        "score_thresh": args.score_thresh, "short_edge": args.short_edge, "long_edge": args.long_edge,
+        "use_adaptive_thr": args.use_adaptive_thr, "use_uncertain_thr": args.use_uncertain_thr,
+        "alpha_unc": args.alpha_unc, "use_tta": args.use_tta, "wbf_iou": args.wbf_iou,
+    }
+    if args.model=="detr":
+        trainer=DetrTrainer(paths,out_dir,**common)
+    else:
+        trainer=RetinaTrainer(paths,out_dir,**common)
+    trainer.fit(args.epochs)
+
+if __name__=="__main__":
+    main()
