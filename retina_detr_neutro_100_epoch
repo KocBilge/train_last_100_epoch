@@ -1,7 +1,7 @@
 %%writefile /content/train_unified_neutro.py
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# Tek script: DETR + RetinaNet + NEUTRO (Boosted thresholds/NMS/TTA)
+# DETR + RetinaNet + NEUTRO (Boosted thresholds/NMS/TTA)
 
 import argparse, json, os, random, tempfile, math, copy
 from pathlib import Path
