@@ -1,0 +1,651 @@
+%%writefile /content/train_unified.py
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Tek script: DETR (HF) + RetinaNet (torchvision) COCO-format eğitim
+- OOP tasarım, ortak Evaluator (COCOeval)
+- AMP (torch.amp), gradient clipping, Grad Accumulation
+- Warmup + Cosine LR, backbone/other farklı LR (DETR)
+- EMA (Exponential Moving Average) ile daha stabil valid
+- AP / AP50 / AP75 / AR / P@0.5 / R@0.5 / F1@0.5
+- Basit augmentasyon: yatay çevirme (+ Retina için ColorJitter)
+- KAN-Like Linear katmanları ile DETR FFN’lerine “KAN dokunuşu”
+"""
+
+import argparse, json, os, random, tempfile, math
+from pathlib import Path
+from dataclasses import dataclass, asdict
+from typing import Dict, List, Tuple, Any
+import numpy as np
+from PIL import Image
+from tqdm import tqdm
+
+import torch
+import torch.nn as nn
+import torch.nn.utils as nn_utils
+from torch.utils.data import Dataset, DataLoader
+from torch.amp import autocast, GradScaler
+from torch.optim.lr_scheduler import LambdaLR
+
+import torchvision
+import torchvision.transforms.functional as TF
+from torchvision.transforms import ColorJitter
+from torchvision.models.detection import retinanet_resnet50_fpn_v2
+from torchvision.ops import box_convert
+from torchvision.models import ResNet50_Weights
+
+from transformers import DetrForObjectDetection, DetrImageProcessor
+from pycocotools.coco import COCO
+from pycocotools.cocoeval import COCOeval
+
+
+# ===========================================================
+# UTILS
+# ===========================================================
+def set_seed(seed=42):
+    random.seed(seed); np.random.seed(seed)
+    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True
+
+def ensure_paths(root: Path) -> Dict[str, Path]:
+    train_im = root / "train"
+    val_im   = root / "valid"
+    train_js = root / "coco_ann" / "instances_train.json"
+    val_js   = root / "coco_ann" / "instances_val.json"
+    for p in [train_im, val_im, train_js, val_js]:
+        if not p.exists():
+            raise FileNotFoundError(f"Missing path: {p}")
+    return {"train_im": train_im, "val_im": val_im, "train_js": train_js, "val_js": val_js}
+
+
+# ===========================================================
+# AUGMENTATION HELPERS
+# ===========================================================
+def hflip_boxes_xywh(boxes_xywh: np.ndarray, width: int) -> np.ndarray:
+    out = boxes_xywh.copy()
+    out[:, 0] = width - out[:, 0] - out[:, 2]
+    return out
+
+def maybe_hflip_pil_and_anns(img: Image.Image, anns: List[Dict[str, Any]], p: float) -> Tuple[Image.Image, List[Dict[str, Any]]]:
+    if random.random() >= p or len(anns) == 0:
+        return img, anns
+    w, h = img.size
+    img2 = TF.hflip(img)
+    boxes = np.array([a["bbox"] for a in anns], dtype=np.float32)
+    boxes2 = hflip_boxes_xywh(boxes, w)
+    anns2 = []
+    for a, bb in zip(anns, boxes2):
+        a2 = dict(a); a2["bbox"] = [float(bb[0]), float(bb[1]), float(bb[2]), float(bb[3])]
+        anns2.append(a2)
+    return img2, anns2
+
+
+# ===========================================================
+# EMA
+# ===========================================================
+class ModelEMA:
+    def __init__(self, model: torch.nn.Module, decay: float = 0.999):
+        self.decay = decay
+        self.shadow = {k: v.detach().clone() for k, v in model.state_dict().items() if v.dtype.is_floating_point}
+        self.backup = None
+
+    @torch.no_grad()
+    def update(self, model: torch.nn.Module):
+        for k, v in model.state_dict().items():
+            if k in self.shadow and v.dtype.is_floating_point:
+                self.shadow[k].mul_(self.decay).add_(v.detach(), alpha=1.0 - self.decay)
+
+    def apply(self, model: torch.nn.Module):
+        self.backup = {k: v.detach().clone() for k, v in model.state_dict().items()}
+        model.load_state_dict({**self.backup, **self.shadow}, strict=False)
+
+    def restore(self, model: torch.nn.Module):
+        if self.backup is not None:
+            model.load_state_dict(self.backup, strict=False)
+            self.backup = None
+
+    def apply_and_restore(self, model: torch.nn.Module):
+        class _Ctx:
+            def __init__(self, ema: ModelEMA, m): self.ema, self.m = ema, m
+            def __enter__(self): self.ema.apply(self.m)
+            def __exit__(self, exc_type, exc, tb): self.ema.restore(self.m)
+        return _Ctx(self, model)
+
+
+# ===========================================================
+# KAN-LIKE LINEAR
+# ===========================================================
+class KANLinear(nn.Linear):
+    """
+    Basit bir KAN-benzeri Linear:
+    y = W x + b + Sum_j alpha_j * phi_j(mean(x))
+
+    - Pretrained DETR Linear ağırlıklarını olduğu gibi kopyalıyoruz.
+    - Ek spline benzeri (RBF) baz fonksiyonları ile çıktı uzayında
+      ek esneklik sağlıyoruz.
+    - alpha parametreleri 0’dan başlıyor => başlangıçta klasik Linear
+      ile tamamen aynı davranıyor (fair comparison).
+    """
+    def __init__(self, in_features, out_features, num_basis: int = 8,
+                 grid_min: float = -1.0, grid_max: float = 1.0, bias: bool = True):
+        super().__init__(in_features, out_features, bias=bias)
+        self.num_basis = num_basis
+        self.register_buffer("grid", torch.linspace(grid_min, grid_max, num_basis))
+        # [out_features, num_basis] spline katsayıları
+        self.alpha = nn.Parameter(torch.zeros(out_features, num_basis))
+        # rbf genişliği (öğrenilebilir tek skaler)
+        self.log_sigma = nn.Parameter(torch.zeros(1))
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        # Standart linear kısım
+        lin = super().forward(input)  # [..., out_features]
+
+        # Basit bir özet: kanal ortalamasını al (son dim)
+        x_proj = input.mean(dim=-1, keepdim=True)  # [..., 1]
+
+        # grid ile fark -> RBF baz fonksiyonları
+        # x_proj: [..., 1] -> [..., num_basis] (broadcast)
+        diff = x_proj - self.grid  # [..., num_basis]
+        sigma = torch.exp(self.log_sigma) + 1e-6
+        basis = torch.exp(- (diff ** 2) / (2 * sigma ** 2))  # [..., num_basis]
+
+        # basis -> out_features boyutuna projeksiyon
+        # alpha: [out_features, num_basis]
+        # result: [..., out_features]
+        extra = torch.matmul(basis, self.alpha.t())
+
+        return lin + extra
+
+
+def inject_kan_linears_into_detr(model: DetrForObjectDetection,
+                                 num_basis: int = 8,
+                                 grid_min: float = -1.0,
+                                 grid_max: float = 1.0):
+    """
+    DETR içindeki encoder/decoder katmanlarında FFN'deki
+    linear1 ve linear2'yi KANLinear ile değiştirir.
+    Ağırlıklar bire bir kopyalanır, alpha sıfırdan başlar.
+    """
+    replaced = 0
+
+    def _recursive(module: nn.Module):
+        nonlocal replaced
+        for name, child in module.named_children():
+            # HF DetrEncoderLayer / DetrDecoderLayer benzeri modüller:
+            if hasattr(child, "linear1") and hasattr(child, "linear2"):
+                old1: nn.Linear = child.linear1
+                old2: nn.Linear = child.linear2
+
+                k1 = KANLinear(old1.in_features, old1.out_features,
+                               num_basis=num_basis, grid_min=grid_min, grid_max=grid_max,
+                               bias=old1.bias is not None)
+                k2 = KANLinear(old2.in_features, old2.out_features,
+                               num_basis=num_basis, grid_min=grid_min, grid_max=grid_max,
+                               bias=old2.bias is not None)
+
+                # Pretrained ağırlıkları kopyala
+                with torch.no_grad():
+                    k1.weight.copy_(old1.weight)
+                    if old1.bias is not None:
+                        k1.bias.copy_(old1.bias)
+                    k2.weight.copy_(old2.weight)
+                    if old2.bias is not None:
+                        k2.bias.copy_(old2.bias)
+
+                setattr(child, "linear1", k1)
+                setattr(child, "linear2", k2)
+                replaced += 2
+
+            _recursive(child)
+
+    _recursive(model)
+    print(f"[KAN] DETR içine KANLinear enjekte edildi. Değiştirilen Linear sayısı: {replaced}")
+
+
+# ===========================================================
+# DATASET
+# ===========================================================
+class CocoBase(Dataset):
+    def __init__(self, img_dir, ann_json, aug_hflip=0.0, color_jitter: ColorJitter | None = None, for_detr=False):
+        self.img_dir = Path(img_dir)
+        self.coco = COCO(str(ann_json))
+        self.ids = list(sorted(self.coco.imgs.keys()))
+        self.cat_ids = sorted(self.coco.getCatIds())
+        self.catid_to_idx = {cid: i for i, cid in enumerate(self.cat_ids)}
+        self.idx_to_catid = {i: cid for i, cid in enumerate(self.cat_ids)}
+        self.aug_hflip = float(aug_hflip)
+        self.color_jitter = color_jitter
+        self.for_detr = for_detr
+
+    def __len__(self):
+        return len(self.ids)
+
+    @property
+    def num_classes(self): return len(self.cat_ids)
+
+    def _read(self, idx):
+        img_id = self.ids[idx]
+        info = self.coco.loadImgs([img_id])[0]
+        image = Image.open(self.img_dir / info["file_name"]).convert("RGB")
+        W, H = image.size
+        anns = [a for a in self.coco.loadAnns(self.coco.getAnnIds(imgIds=[img_id]))
+                if a.get("bbox") and a["bbox"][2] > 0 and a["bbox"][3] > 0 and not a.get("iscrowd", 0)]
+        return img_id, image, (H, W), anns
+
+
+class CocoForDetr(CocoBase):
+    def __getitem__(self, idx):
+        img_id, img, orig_size, anns = self._read(idx)
+        img, anns = maybe_hflip_pil_and_anns(img, anns, self.aug_hflip)
+        if self.color_jitter is not None:
+            img = self.color_jitter(img)
+        anns2 = [{"category_id": int(self.catid_to_idx[a["category_id"]]),
+                  "bbox": a["bbox"], **{k: v for k, v in a.items() if k not in ("category_id","bbox")}}
+                 for a in anns]
+        return img, {"image_id": int(img_id), "annotations": anns2, "orig_size": orig_size}
+
+
+class CocoForRetina(CocoBase):
+    def __getitem__(self, idx):
+        img_id, img, orig_size, anns = self._read(idx)
+        img, anns = maybe_hflip_pil_and_anns(img, anns, self.aug_hflip)
+        if self.color_jitter is not None:
+            img = self.color_jitter(img)
+        img_t = TF.to_tensor(img)
+        if len(anns) > 0:
+            b = torch.tensor([a["bbox"] for a in anns], dtype=torch.float32)
+            boxes = box_convert(b, in_fmt="xywh", out_fmt="xyxy")
+            labels = torch.tensor([self.catid_to_idx[a["category_id"]] + 1 for a in anns], dtype=torch.int64)
+        else:
+            boxes = torch.zeros((0,4), dtype=torch.float32)
+            labels = torch.zeros((0,), dtype=torch.int64)
+        return img_t, {"image_id": torch.tensor([int(img_id)]), "boxes": boxes, "labels": labels}, orig_size
+
+
+# ===========================================================
+# COLLATE
+# ===========================================================
+def collate_detr(processor):
+    def _f(batch):
+        imgs, targs = list(zip(*batch))
+        enc = processor(images=list(imgs), annotations=list(targs), return_tensors="pt")
+        return {"pixel_values": enc["pixel_values"],
+                "labels": enc["labels"],
+                "image_ids": [t["image_id"] for t in targs],
+                "orig_sizes": torch.tensor([t["orig_size"] for t in targs], dtype=torch.long)}
+    return _f
+
+def collate_retina():
+    def _f(batch):
+        imgs, targs, sizes = list(zip(*batch))
+        return {"images": list(imgs), "targets": list(targs),
+                "image_ids": [int(t["image_id"].item()) for t in targs],
+                "orig_sizes": torch.tensor(list(sizes), dtype=torch.long)}
+    return _f
+
+
+# ===========================================================
+# EVALUATOR
+# ===========================================================
+@dataclass
+class EvalSummary:
+    AP: float; AP50: float; AP75: float; APS: float; APM: float; APL: float
+    AR1: float; AR10: float; AR100: float; P50: float; R50: float; F1_50: float
+    def to_dict(self): return asdict(self)
+
+def summarize_coco(coco_eval, iou_thr=0.5):
+    coco_eval.summarize()
+    s = coco_eval.stats
+    AP, AP50, AP75, APS, APM, APL, AR1, AR10, AR100 = [float(x) for x in s[:9]]
+    prec, rec = coco_eval.eval["precision"], coco_eval.eval["recall"]
+    t_idx = np.where(np.isclose(coco_eval.params.iouThrs, iou_thr))[0]
+    if len(t_idx)==0: P50=R50=F1=0
+    else:
+        t=t_idx[0]; P=prec[t]; P=P[P>-1]; R=rec[t]; R=R[R>-1]
+        P50=float(P.mean()) if P.size else 0; R50=float(R.mean()) if R.size else 0
+        F1=(2*P50*R50/(P50+R50)) if (P50+R50)>0 else 0
+    return EvalSummary(AP,AP50,AP75,APS,APM,APL,AR1,AR10,AR100,P50,R50,F1), {}
+
+class Evaluator:
+    def __init__(self, ds_val, device): self.ds_val, self.device = ds_val, device
+    @torch.no_grad()
+    def evaluate_from_predictions(self, results, ids):
+        if not results: return EvalSummary(*([0]*12)), {}
+        with tempfile.NamedTemporaryFile(mode="w",suffix=".json",delete=False) as f:
+            json.dump(results,f); tmp=f.name
+        coco_dt=self.ds_val.coco.loadRes(tmp)
+        cocoEval=COCOeval(self.ds_val.coco,coco_dt,"bbox")
+        cocoEval.params.imgIds=list(set(ids))
+        cocoEval.evaluate(); cocoEval.accumulate()
+        out=summarize_coco(cocoEval,0.5)
+        os.remove(tmp)
+        return out
+
+
+# ===========================================================
+# LR SCHEDULE (warmup + cosine)
+# ===========================================================
+def make_warmup_cosine(total_steps: int, warmup_steps: int, min_scale: float = 0.1):
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return step / max(1, warmup_steps)
+        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        progress = min(1.0, max(0.0, progress))
+        return min_scale + (1.0 - min_scale) * 0.5 * (1.0 + math.cos(math.pi * progress))
+    return lr_lambda
+
+
+# ===========================================================
+# TRAINERS
+# ===========================================================
+class DetrTrainer:
+    def __init__(self, paths, out_dir, **kw):
+        set_seed(kw.get("seed",42))
+        self.device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print("[DETR] device:", self.device)
+
+        self.use_kan = kw.get("kan", False)
+        self.kan_basis = kw.get("kan_basis", 8)
+
+        shortest = kw.get("short_edge", 800)
+        longest  = kw.get("long_edge", 1333)
+        self.processor=DetrImageProcessor.from_pretrained(
+            "facebook/detr-resnet-50",
+            size={"shortest_edge": shortest, "longest_edge": longest}
+        )
+
+        aug_hflip = kw.get("hflip", 0.5)
+        color_jitter = ColorJitter(0.1, 0.1, 0.1, 0.05) if kw.get("cj", False) else None
+        self.ds_tr=CocoForDetr(paths["train_im"],paths["train_js"],aug_hflip=aug_hflip,color_jitter=color_jitter,for_detr=True)
+        self.ds_va=CocoForDetr(paths["val_im"],paths["val_js"],aug_hflip=0.0,color_jitter=None,for_detr=True)
+
+        self.dl_tr=DataLoader(self.ds_tr,batch_size=kw.get("batch_size",4),shuffle=True,
+                              num_workers=kw.get("num_workers",2),pin_memory=True,collate_fn=collate_detr(self.processor))
+        self.dl_va=DataLoader(self.ds_va,batch_size=kw.get("batch_size",4),shuffle=False,
+                              num_workers=kw.get("num_workers",2),pin_memory=True,collate_fn=collate_detr(self.processor))
+
+        self.model=DetrForObjectDetection.from_pretrained(
+            "facebook/detr-resnet-50",
+            num_labels=self.ds_tr.num_classes,
+            ignore_mismatched_sizes=True
+        ).to(self.device)
+
+        # KAN-Like FFN enjekte et (opsiyonel)
+        if self.use_kan:
+            print("[DETR] KAN modu AÇIK. FFN Linear katmanları KANLinear ile değiştiriliyor...")
+            inject_kan_linears_into_detr(self.model, num_basis=self.kan_basis)
+
+        backbone, others = [], []
+        for n,p in self.model.named_parameters():
+            (backbone if "backbone" in n else others).append(p)
+        base_lr = kw.get("lr",1e-4)
+        self.opt=torch.optim.AdamW(
+            [{"params": backbone, "lr": base_lr*0.1}, {"params": others, "lr": base_lr}],
+            weight_decay=kw.get("weight_decay",1e-4)
+        )
+
+        self.use_amp = not kw.get("no_amp", False)
+        self.scaler  = GradScaler('cuda', enabled=self.use_amp)
+        self.accum_steps = max(1, int(kw.get("accum", 1)))
+
+        total_steps = len(self.dl_tr) * kw.get("epochs",100)
+        warmup_steps = int(kw.get("warmup_ratio", 0.05) * total_steps)
+        self.scheduler = LambdaLR(self.opt, make_warmup_cosine(total_steps, warmup_steps, min_scale=kw.get("cos_min",0.1)))
+
+        self.ema = ModelEMA(self.model, decay=kw.get("ema_decay", 0.999)) if kw.get("ema", True) else None
+        self.score_thresh = float(kw.get("score_thresh", 0.05))
+
+        self.evaluator=Evaluator(self.ds_va,self.device)
+        self.out_dir=out_dir; out_dir.mkdir(parents=True,exist_ok=True)
+        self.best=-np.inf
+        self.min_d=kw.get("min_delta",1e-3)
+
+    def _log_metrics(self, epoch: int, summ: EvalSummary):
+        d = summ.to_dict()
+        d["epoch"] = epoch
+        d["model"] = "detr_kan" if self.use_kan else "detr"
+        log_path = self.out_dir / "metrics_detr.jsonl"
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(d) + "\n")
+
+    def fit(self,epochs):
+        step=0
+        for e in range(1,epochs+1):
+            self.model.train(); total_loss=0.0; n_batches=0
+            self.opt.zero_grad(set_to_none=True)
+            for bi, b in enumerate(tqdm(self.dl_tr,desc=f"[DETR][train {e}]")):
+                pv=b["pixel_values"].to(self.device)
+                labels=[{k:(v.to(self.device) if isinstance(v,torch.Tensor) else v) for k,v in t.items()} for t in b["labels"]]
+                with autocast('cuda',enabled=self.use_amp):
+                    out=self.model(pixel_values=pv,labels=labels); loss=out.loss
+                self.scaler.scale(loss/self.accum_steps).backward()
+                self.scaler.unscale_(self.opt)
+                nn_utils.clip_grad_norm_(self.model.parameters(),0.1)
+
+                if (bi+1) % self.accum_steps == 0:
+                    self.scaler.step(self.opt); self.scaler.update()
+                    self.opt.zero_grad(set_to_none=True)
+                    self.scheduler.step(); step+=1
+                    if self.ema: self.ema.update(self.model)
+
+                total_loss += float(loss.detach()); n_batches += 1
+
+            summ,_=self._eval(use_ema=True)
+            self._log_metrics(e, summ)
+            tag = "KAN" if self.use_kan else "BASE"
+            print(f"[DETR-{tag}][epoch {e}] loss={total_loss/max(1,n_batches):.4f} | AP50={summ.AP50:.3f} | F1={summ.F1_50:.3f}")
+            # En iyi modeli kaydet (erken durdurma yok)
+            if summ.AP50>self.best+self.min_d:
+                self.best=summ.AP50
+                best_name = "best_detr_kan.pt" if self.use_kan else "best_detr.pt"
+                torch.save(self.model.state_dict(), self.out_dir/best_name)
+                if self.ema:
+                    ema_name = "best_detr_kan_ema.pth" if self.use_kan else "best_detr_ema.pth"
+                    torch.save(self.ema.shadow, self.out_dir/ema_name)
+
+    @torch.no_grad()
+    def _eval(self, use_ema: bool = True):
+        if self.ema and use_ema:
+            ctx = self.ema.apply_and_restore(self.model)
+        else:
+            class _N:
+                def __enter__(self): pass
+                def __exit__(self, a,b,c): pass
+            ctx = _N()
+
+        with ctx:
+            self.model.eval(); res=[];ids=[]
+            for b in self.dl_va:
+                pv=b["pixel_values"].to(self.device)
+                out=self.model(pixel_values=pv)
+                preds=self.processor.post_process_object_detection(
+                    out, target_sizes=b["orig_sizes"].to(self.device), threshold=self.score_thresh
+                )
+                for i,p in enumerate(preds):
+                    img=int(b["image_ids"][i])
+                    for (x1,y1,x2,y2),sc,lb in zip(p["boxes"],p["scores"],p["labels"]):
+                        w,h=x2-x1,y2-y1
+                        res.append({"image_id":img,"category_id":int(self.ds_va.idx_to_catid[int(lb)]),
+                                    "bbox":[float(x1),float(y1),float(w),float(h)],"score":float(sc)})
+                    ids.append(img)
+            return self.evaluator.evaluate_from_predictions(res,ids)
+
+
+class RetinaTrainer:
+    def __init__(self, paths, out_dir, **kw):
+        set_seed(kw.get("seed",42))
+        self.device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print("[RETINA] device:", self.device)
+
+        aug_hflip = kw.get("hflip", 0.5)
+        color_jitter = ColorJitter(0.1, 0.1, 0.1, 0.05) if kw.get("cj", True) else None
+        self.ds_tr=CocoForRetina(paths["train_im"],paths["train_js"],aug_hflip=aug_hflip,color_jitter=color_jitter)
+        self.ds_va=CocoForRetina(paths["val_im"],paths["val_js"],aug_hflip=0.0,color_jitter=None)
+        self.dl_tr=DataLoader(self.ds_tr,batch_size=kw.get("batch_size",4),shuffle=True,
+                              num_workers=kw.get("num_workers",2),pin_memory=True,collate_fn=collate_retina())
+        self.dl_va=DataLoader(self.ds_va,batch_size=kw.get("batch_size",4),shuffle=False,
+                              num_workers=kw.get("num_workers",2),pin_memory=True,collate_fn=collate_retina())
+        nc=self.ds_tr.num_classes+1
+        self.model=retinanet_resnet50_fpn_v2(weights=None,
+                    weights_backbone=ResNet50_Weights.IMAGENET1K_V2,num_classes=nc).to(self.device)
+
+        self.opt=torch.optim.AdamW(self.model.parameters(),lr=kw.get("lr",1e-4),weight_decay=kw.get("weight_decay",1e-4))
+        self.use_amp = not kw.get("no_amp", False)
+        self.scaler  = GradScaler('cuda', enabled=self.use_amp)
+        self.accum_steps = max(1, int(kw.get("accum", 1)))
+
+        total_steps = len(self.dl_tr) * kw.get("epochs",100)
+        warmup_steps = int(kw.get("warmup_ratio", 0.05) * total_steps)
+        self.scheduler = LambdaLR(self.opt, make_warmup_cosine(total_steps, warmup_steps, min_scale=kw.get("cos_min",0.1)))
+
+        self.ema = ModelEMA(self.model, decay=kw.get("ema_decay", 0.999)) if kw.get("ema", True) else None
+        self.score_thresh = float(kw.get("score_thresh", 0.05))
+
+        self.evaluator=Evaluator(self.ds_va,self.device)
+        self.out_dir=out_dir; out_dir.mkdir(parents=True,exist_ok=True)
+        self.best=-np.inf
+        self.min_d=kw.get("min_delta",1e-3)
+
+    def _log_metrics(self, epoch: int, summ: EvalSummary):
+        d = summ.to_dict()
+        d["epoch"] = epoch
+        d["model"] = "retina"
+        log_path = self.out_dir / "metrics_retina.jsonl"
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(d) + "\n")
+
+    def fit(self,epochs):
+        for e in range(1,epochs+1):
+            self.model.train(); total_loss=0.0;n_batches=0
+            self.opt.zero_grad(set_to_none=True)
+            for bi, b in enumerate(tqdm(self.dl_tr,desc=f"[RETINA][train {e}]")):
+                imgs=[im.to(self.device) for im in b["images"]]
+                tg=[{"boxes":t["boxes"].to(self.device),"labels":t["labels"].to(self.device)} for t in b["targets"]]
+                with autocast('cuda',enabled=self.use_amp):
+                    loss_d=self.model(imgs,tg); loss=sum(v for v in loss_d.values())
+                self.scaler.scale(loss/self.accum_steps).backward()
+                self.scaler.unscale_(self.opt)
+                nn_utils.clip_grad_norm_(self.model.parameters(),0.1)
+
+                if (bi+1) % self.accum_steps == 0:
+                    self.scaler.step(self.opt); self.scaler.update()
+                    self.opt.zero_grad(set_to_none=True)
+                    self.scheduler.step()
+                    if self.ema: self.ema.update(self.model)
+
+                total_loss+=float(loss.detach()); n_batches+=1
+
+            summ,_=self._eval(use_ema=True)
+            self._log_metrics(e, summ)
+            print(f"[RETINA][epoch {e}] loss={total_loss/max(1,n_batches):.4f} | AP50={summ.AP50:.3f}")
+            # En iyi modeli kaydet (erken durdurma yok)
+            if summ.AP50>self.best+self.min_d:
+                self.best=summ.AP50
+                torch.save(self.model.state_dict(), self.out_dir/"best_retina.pt")
+                if self.ema:
+                    torch.save(self.ema.shadow, self.out_dir/"best_retina_ema.pth")
+
+    @torch.no_grad()
+    def _eval(self, use_ema: bool = True):
+        if self.ema and use_ema:
+            ctx = self.ema.apply_and_restore(self.model)
+        else:
+            class _N:
+                def __enter__(self): pass
+                def __exit__(self, a,b,c): pass
+            ctx = _N()
+
+        with ctx:
+            self.model.eval(); res=[];ids=[]
+            for b in self.dl_va:
+                outs=self.model([im.to(self.device) for im in b["images"]])
+                for i,p in enumerate(outs):
+                    img=b["image_ids"][i]
+                    for (x1,y1,x2,y2),sc,lb in zip(p["boxes"].cpu(),p["scores"].cpu(),p["labels"].cpu()):
+                        if float(sc) < self.score_thresh:
+                            continue
+                        if int(lb) == 0:
+                            continue
+                        w,h=x2-x1,y2-y1
+                        res.append({"image_id":img,"category_id":int(self.ds_va.idx_to_catid[int(lb)-1]),
+                                    "bbox":[float(x1),float(y1),float(w),float(h)],"score":float(sc)})
+                    ids.append(img)
+            return self.evaluator.evaluate_from_predictions(res,ids)
+
+
+# ===========================================================
+# CLI
+# ===========================================================
+def parse_args():
+    p=argparse.ArgumentParser()
+    p.add_argument("--model",choices=["detr","retina"],required=True)
+    p.add_argument("--data-root",required=True, help="Kök klasör: train/, valid/, coco_ann/instances_*.json")
+    p.add_argument("--out-dir",default="./out_model")
+    p.add_argument("--epochs",type=int,default=200)
+    p.add_argument("--batch-size",type=int,default=4)
+    p.add_argument("--num-workers",type=int,default=2)
+    p.add_argument("--lr",type=float,default=1e-4)
+    p.add_argument("--weight-decay",type=float,default=1e-4)
+    p.add_argument("--seed",type=int,default=42)
+    # geriye dönük uyumluluk için tutuyoruz; kullanılmıyor
+    p.add_argument("--patience",type=int,default=40)
+    p.add_argument("--min-delta",type=float,default=1e-3)
+    p.add_argument("--no-amp",action="store_true", help="AMP kapat")
+    p.add_argument("--accum",type=int,default=1, help="Gradient accumulation steps")
+    p.add_argument("--warmup-ratio",type=float,default=0.05, help="Toplam adıma oran")
+    p.add_argument("--cos-min",type=float,default=0.1, help="Cosine için min LR oranı")
+    p.add_argument("--ema",action="store_true", help="EMA AÇ (varsayılan: açık)", default=True)
+    p.add_argument("--ema-decay",type=float,default=0.999)
+    p.add_argument("--hflip",type=float,default=0.5, help="Yatay çevirme olasılığı (train)")
+    p.add_argument("--cj",action="store_true", help="Hafif ColorJitter (DETR opsiyonel)")
+    p.add_argument("--score-thresh",type=float,default=0.05, help="Eval skor eşiği")
+    p.add_argument("--short-edge",type=int,default=800, help="DETR için kısa kenar")
+    p.add_argument("--long-edge",type=int,default=1333, help="DETR için uzun kenar")
+
+    # KAN opsiyonları
+    p.add_argument("--kan",action="store_true", help="DETR FFN katmanlarını KANLinear ile değiştir")
+    p.add_argument("--kan-basis",type=int,default=8, help="KANLinear baz fonksiyonu sayısı")
+    return p.parse_args()
+
+
+def main():
+    args=parse_args()
+    set_seed(args.seed)
+    paths=ensure_paths(Path(args.data_root))
+    out_dir=Path(args.out_dir); out_dir.mkdir(parents=True,exist_ok=True)
+
+    common = {
+        "batch_size": args.batch_size,
+        "num_workers": args.num_workers,
+        "lr": args.lr,
+        "weight_decay": args.weight_decay,
+        "seed": args.seed,
+        "epochs": args.epochs,
+        "min_delta": args.min_delta,   # yalnızca “en iyiyi kaydet” için
+        "no_amp": args.no_amp,
+        "accum": args.accum,
+        "warmup_ratio": args.warmup_ratio,
+        "cos_min": args.cos_min,
+        "ema": args.ema,
+        "ema_decay": args.ema_decay,
+        "hflip": args.hflip,
+        "cj": args.cj,
+        "score_thresh": args.score_thresh,
+        "short_edge": args.short_edge,
+        "long_edge": args.long_edge,
+        "kan": args.kan,
+        "kan_basis": args.kan_basis,
+    }
+
+    if args.model=="detr":
+        trainer=DetrTrainer(paths,out_dir,**common)
+    else:
+        if args.kan:
+            print("[UYARI] --kan sadece DETR için anlamlıdır, RetinaNet'te yok sayılıyor.")
+        trainer=RetinaTrainer(paths,out_dir,**common)
+    trainer.fit(args.epochs)
+
+
+if __name__=="__main__":
+    main()
